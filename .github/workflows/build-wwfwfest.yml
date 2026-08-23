@@ -39,6 +39,23 @@ jobs:
             jotego/jtcore20 \
             /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
 
+      - name: Show Quartus diagnostics after a failure
+        if: failure()
+        run: |
+          echo "===== MAIN QUARTUS LOG ====="
+          if [ -f log/mister/jtwwfwfest.log ]; then
+            tail -n 400 log/mister/jtwwfwfest.log
+          else
+            echo "Main Quartus log not found"
+          fi
+          echo "===== SEED REPORTS ====="
+          find cores/wwfwfest/seed -type f \
+            \( -iname '*.log' -o -iname '*.rpt' -o -iname '*.msg' \) \
+            -print 2>/dev/null | while IFS= read -r report; do
+              echo "----- $report -----"
+              tail -n 200 "$report"
+            done
+
       - name: Collect MiSTer files
         run: |
           cp /tmp/wwfwfest-main.mra "release/mra/WWF WrestleFest (World).mra"
