@@ -17,7 +17,12 @@ jobs:
       - name: Check out JTFRAME
         uses: actions/checkout@v5
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Check out required public CPU and audio modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
 
       - name: Restore WWF WrestleFest core
         env:
