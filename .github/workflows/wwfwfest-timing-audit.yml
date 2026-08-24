@@ -1,0 +1,168 @@
+name: Audit WWF WrestleFest video timing
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/wwfwfest-timing-audit.yml
+      - .github/workflows/build-wwfwfest.yml
+
+permissions:
+  contents: read
+
+jobs:
+  timing-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out JTFRAME fork
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Restore exact WrestleFest HDL from build workflow
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, pathlib, re, zipfile
+          workflow = pathlib.Path('.github/workflows/build-wwfwfest.yml').read_text()
+          m = re.search(r'^\s*CORE_ARCHIVE:\s*([A-Za-z0-9+/=]+)\s*$', workflow, re.M)
+          if not m:
+              raise SystemExit('CORE_ARCHIVE not found')
+          archive = pathlib.Path('/tmp/wwfwfest-core.zip')
+          archive.write_bytes(base64.b64decode(m.group(1)))
+          with zipfile.ZipFile(archive) as zf:
+              zf.extractall('.')
+          print('Restored:', pathlib.Path('cores/wwfwfest/hdl/jtwwfw_timing.v').resolve())
+          PY
+
+      - name: Install Icarus Verilog
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iverilog
+
+      - name: Verify JTFRAME sync convention
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('modules/jtframe/hdl/video/jtframe_vtimer.v')
+          s = p.read_text()
+          required = [
+              'if (H==HS_START)',
+              'HS <= 1;',
+              'if (H==HS_END)',
+              'HS <= 0;',
+              'if (vdump==VS_START) VS <= 1;',
+              'if (vdump==VS_END  ) VS <= 0;',
+          ]
+          missing = [x for x in required if x not in s]
+          if missing:
+              raise SystemExit('JTFRAME sync convention changed/missing: ' + repr(missing))
+          print('PASS: JTFRAME asserts HS/VS HIGH during the sync pulse')
+          PY
+
+      - name: Build strict raster contract testbench
+        shell: bash
+        run: |
+          cat > /tmp/timing_contract_tb.v <<'VERILOG'
+          `timescale 1ns/1ps
+          module timing_contract_tb;
+              reg clk = 0;
+              reg rst = 1;
+              reg pxl_cen = 1;
+              wire [8:0] hcnt, vcnt;
+              wire LHBL, LVBL, HS, VS, irq2_tick;
+
+              integer expected_h = 0;
+              integer expected_v = 0;
+              integer samples = 0;
+              integer irq_count = 0;
+              integer started = 0;
+              integer frame_done = 0;
+
+              always #5 clk = ~clk;
+
+              jtwwfw_timing dut(
+                  .rst(rst), .clk(clk), .pxl_cen(pxl_cen),
+                  .hcnt(hcnt), .vcnt(vcnt),
+                  .LHBL(LHBL), .LVBL(LVBL), .HS(HS), .VS(VS),
+                  .irq2_tick(irq2_tick)
+              );
+
+              task check_signals;
+                  begin
+                      if (LHBL !== (hcnt < 9'd320))
+                          $fatal(1, "LHBL mismatch at H=%0d V=%0d: got %b", hcnt, vcnt, LHBL);
+                      if (LVBL !== (vcnt >= 9'd8 && vcnt < 9'd248))
+                          $fatal(1, "LVBL mismatch at H=%0d V=%0d: got %b", hcnt, vcnt, LVBL);
+                      if (HS !== (hcnt >= 9'd336 && hcnt < 9'd368))
+                          $fatal(1, "HS polarity/window mismatch at H=%0d V=%0d: got %b", hcnt, vcnt, HS);
+                      if (VS !== (vcnt >= 9'd256 && vcnt < 9'd264))
+                          $fatal(1, "VS polarity/window mismatch at H=%0d V=%0d: got %b", hcnt, vcnt, VS);
+                  end
+              endtask
+
+              initial begin
+                  repeat (4) @(negedge clk);
+                  rst = 0;
+              end
+
+              always @(negedge clk) begin
+                  if (!rst && !frame_done) begin
+                      check_signals();
+                      if (irq2_tick) irq_count = irq_count + 1;
+
+                      if (!started) begin
+                          if (hcnt == 0 && vcnt == 0) begin
+                              started = 1;
+                              samples = 1;
+                              expected_h = 1;
+                              expected_v = 0;
+                          end
+                      end else begin
+                          if (hcnt !== expected_h[8:0] || vcnt !== expected_v[8:0])
+                              $fatal(1, "Counter sequence mismatch: expected H=%0d V=%0d, got H=%0d V=%0d",
+                                  expected_h, expected_v, hcnt, vcnt);
+
+                          samples = samples + 1;
+
+                          if (expected_h == 447 && expected_v == 271) begin
+                              frame_done = 1;
+                              if (samples != 121856)
+                                  $fatal(1, "Frame total mismatch: %0d pixels, expected 121856", samples);
+                              if (irq_count != 17)
+                                  $fatal(1, "IRQ regression: %0d pulses/frame, expected current design value 17", irq_count);
+                              $display("PASS: raster = 448 x 272 = 121856 pixels");
+                              $display("PASS: active = H[0..319], V[8..247] = 320 x 240");
+                              $display("PASS: HS HIGH at H[336..367], width 32 pixels");
+                              $display("PASS: VS HIGH at V[256..263], width 8 lines");
+                              $display("PASS: HS/VS polarity matches JTFRAME contract");
+                              $display("PASS: current raster IRQ cadence = 17 pulses/frame");
+                              $display("INFO: at 7.000 MHz pixel clock refresh = 57.444852941 Hz");
+                              $display("INFO: current IRQ rate = 976.5625 Hz; real WrestleFest PCB report ~1.63 kHz requires separate audit");
+                              $finish;
+                          end else if (expected_h == 447) begin
+                              expected_h = 0;
+                              expected_v = expected_v + 1;
+                          end else begin
+                              expected_h = expected_h + 1;
+                          end
+                      end
+                  end
+              end
+
+              initial begin
+                  #3000000;
+                  $fatal(1, "timing contract test timeout");
+              end
+          endmodule
+          VERILOG
+
+      - name: Run strict HS VS blanking and raster simulation
+        shell: bash
+        run: |
+          iverilog -g2005 -Wall -o /tmp/timing_contract_tb \
+            /tmp/timing_contract_tb.v \
+            cores/wwfwfest/hdl/jtwwfw_timing.v
+          vvp /tmp/timing_contract_tb
