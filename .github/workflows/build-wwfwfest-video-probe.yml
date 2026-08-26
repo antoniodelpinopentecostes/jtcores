@@ -1,0 +1,233 @@
+name: Build WWF WrestleFest video probe after BGFix1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build-wwfwfest-video-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Check out required modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
+
+      - name: Restore FreeRunSync baseline
+        run: |
+          BASE=.github/workflows/build-wwfwfest-freerun-sync.yml
+          test -f "$BASE"
+          CORE_ARCHIVE="$(sed -n 's/^          CORE_ARCHIVE: //p' "$BASE" | head -n1)"
+          test -n "$CORE_ARCHIVE"
+          printf '%s' "$CORE_ARCHIVE" | base64 --decode > /tmp/wwfwfest-source.zip
+          unzip -q -o /tmp/wwfwfest-source.zip
+          test -f cores/wwfwfest/hdl/jtwwfw_video.v
+
+          # Preserve the exact FreeRunSync HDL before any graphics patch.
+          mkdir -p wwfwfest-diag/baseline
+          cp cores/wwfwfest/hdl/jtwwfw_video.v  wwfwfest-diag/baseline/
+          cp cores/wwfwfest/hdl/jtwwfw_timing.v wwfwfest-diag/baseline/
+          cp cores/wwfwfest/hdl/jtwwfw_main.v   wwfwfest-diag/baseline/
+
+      - name: Apply TEXT fix 2, BG unpack fix 1 and disable OSD logo
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p=Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s=p.read_text()
+
+          old_text='''assign char_sorted = {
+              char_data[15],char_data[14],char_data[ 7],char_data[ 6],
+              char_data[31],char_data[30],char_data[23],char_data[22],
+              char_data[13],char_data[12],char_data[ 5],char_data[ 4],
+              char_data[29],char_data[28],char_data[21],char_data[20],
+              char_data[11],char_data[10],char_data[ 3],char_data[ 2],
+              char_data[27],char_data[26],char_data[19],char_data[18],
+              char_data[ 9],char_data[ 8],char_data[ 1],char_data[ 0],
+              char_data[25],char_data[24],char_data[17],char_data[16]
+          };'''
+          new_text='''assign char_sorted = {
+              char_data[ 6],char_data[ 7],char_data[14],char_data[15],
+              char_data[22],char_data[23],char_data[30],char_data[31],
+              char_data[ 4],char_data[ 5],char_data[12],char_data[13],
+              char_data[20],char_data[21],char_data[28],char_data[29],
+              char_data[ 2],char_data[ 3],char_data[10],char_data[11],
+              char_data[18],char_data[19],char_data[26],char_data[27],
+              char_data[ 0],char_data[ 1],char_data[ 8],char_data[ 9],
+              char_data[16],char_data[17],char_data[24],char_data[25]
+          };'''
+          if old_text not in s:
+              raise SystemExit('Expected FreeRunSync char_sorted block not found')
+          s=s.replace(old_text,new_text)
+
+          # MRA packing for gfx3 is output16 with IC2 map=01 and IC1 map=10.
+          # For each 8-pixel half-row, SDRAM therefore returns byte lanes:
+          #   b0=IC1 even (plane0), b1=IC2 even (plane2),
+          #   b2=IC1 odd  (plane1), b3=IC2 odd  (plane3).
+          # JTFRAME requires {plane3,plane2,plane1,plane0}, MSB=left pixel.
+          for sig in ('fgrom_data','bgrom_data'):
+              pat=re.compile(
+                  r'\.rom_data\(\{\s*'+re.escape(sig)+r'\[\s*8\].*?'+
+                  re.escape(sig)+r'\[23\]\s*\}\)', re.S)
+              repl='.rom_data({'+sig+'[31:24],'+sig+'[15:8],'+sig+'[23:16],'+sig+'[7:0]})'
+              s,n=pat.subn(repl,s,count=1)
+              if n != 1:
+                  raise SystemExit(f'Expected {sig} legacy unpack block not found exactly once (found {n})')
+
+          p.write_text(s)
+
+          macros=Path('cores/wwfwfest/cfg/macros.def')
+          mx=macros.read_text()
+          if 'JTFRAME_OSD_NOLOGO' not in mx:
+              mx=mx.rstrip()+"\n\n# Do not draw the JTFRAME J logo in the MiSTer OSD\nJTFRAME_OSD_NOLOGO\n"
+          macros.write_text(mx)
+
+          # Static guards: only intended subsystems changed.
+          final=p.read_text()
+          assert 'fgrom_data[31:24],fgrom_data[15:8],fgrom_data[23:16],fgrom_data[7:0]' in final
+          assert 'bgrom_data[31:24],bgrom_data[15:8],bgrom_data[23:16],bgrom_data[7:0]' in final
+          assert 'JTFRAME_OSD_NOLOGO' in macros.read_text()
+          PY
+
+      - name: Validate TEXT and BG pixel packing against MAME
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iverilog
+
+          python3 - <<'PY'
+          # --- TEXT: MAME tiles8x8_layout ---
+          B=[0xA5,0x3C,0x96,0x69]
+          def plane(hi,lo):
+              v=0
+              for b in B:
+                  v=(v<<1)|((b>>hi)&1)
+                  v=(v<<1)|((b>>lo)&1)
+              return v
+          text_expected=(plane(6,7)<<24)|(plane(4,5)<<16)|(plane(2,3)<<8)|plane(0,1)
+          assert text_expected == 0x4679B986
+          print('PASS: TEXT MAME reference unpack = 4679B986')
+
+          # --- BG0/BG1: MAME wwf_tile_layout ---
+          # MAME plane offsets are {8,0,half+8,half+0}; plane list order
+          # contributes pixel bits 3,2,1,0 respectively. MRA output16 packs
+          # IC1 in even byte lane (map=10) and IC2 in odd byte lane (map=01).
+          # Use asymmetric bytes so a bit reversal cannot pass accidentally.
+          A0=0x96  # IC2 even -> pixel bit 2
+          A1=0x3C  # IC2 odd  -> pixel bit 3
+          B0=0xA5  # IC1 even -> pixel bit 0
+          B1=0x69  # IC1 odd  -> pixel bit 1
+
+          # 32-bit SDRAM data, little-endian byte lanes after the MRA stream:
+          lanes=[B0,A0,B1,A1]
+          d=lanes[0] | (lanes[1]<<8) | (lanes[2]<<16) | (lanes[3]<<24)
+          assert d == 0x3C6996A5
+
+          # New Verilog slice order: {d[31:24],d[15:8],d[23:16],d[7:0]}
+          packed=(lanes[3]<<24)|(lanes[1]<<16)|(lanes[2]<<8)|lanes[0]
+          assert packed == 0x3C9669A5
+
+          p3=(packed>>24)&0xff; p2=(packed>>16)&0xff
+          p1=(packed>>8)&0xff;  p0=packed&0xff
+          mame=[]; jt=[]
+          for x in range(8):
+              sh=7-x  # MAME readbit bit 0 is the physical MSB
+              m=((A1>>sh)&1)<<3 | ((A0>>sh)&1)<<2 | ((B1>>sh)&1)<<1 | ((B0>>sh)&1)
+              j=((p3>>sh)&1)<<3 | ((p2>>sh)&1)<<2 | ((p1>>sh)&1)<<1 | ((p0>>sh)&1)
+              mame.append(m); jt.append(j)
+          assert jt == mame
+          print('PASS: BG0/BG1 byte lanes = A1,A0,B1,B0; no bit reversal')
+          print('PASS: all 8 pixels match MAME wwf_tile_layout reference')
+          PY
+
+      - name: Revalidate free-running video timing
+        run: |
+          FRAC_CEN="$(find modules/jtframe -name jtframe_frac_cen.v -print -quit)"
+          test -n "$FRAC_CEN"
+          iverilog -DSIMULATION -g2005 -Wall -o /tmp/timing_tb \
+            cores/wwfwfest/ver/timing_tb.v cores/wwfwfest/hdl/jtwwfw_timing.v "$FRAC_CEN"
+          vvp /tmp/timing_tb
+
+      - name: Snapshot exact post-BGFix1 video HDL
+        run: |
+          mkdir -p wwfwfest-diag/post-bgfix1
+          cp cores/wwfwfest/hdl/jtwwfw_video.v  wwfwfest-diag/post-bgfix1/
+          cp cores/wwfwfest/hdl/jtwwfw_timing.v wwfwfest-diag/post-bgfix1/
+          cp cores/wwfwfest/hdl/jtwwfw_main.v   wwfwfest-diag/post-bgfix1/
+          cp cores/wwfwfest/cfg/macros.def      wwfwfest-diag/post-bgfix1/
+
+          {
+            echo '=== WWF WrestleFest video diagnostic ==='
+            echo
+            echo '--- Verilog files ---'
+            find cores/wwfwfest -maxdepth 3 -type f \( -name '*.v' -o -name '*.sv' -o -name '*.def' \) | sort
+            echo
+            echo '--- ROM-data connections in jtwwfw_video.v ---'
+            grep -n -E 'rom_data|rom_addr|char_sorted|fgrom_data|bgrom_data|spr|sprite|obj' \
+              cores/wwfwfest/hdl/jtwwfw_video.v || true
+            echo
+            echo '--- Sprite-related references in all WWF HDL ---'
+            grep -RniE 'spr|sprite|obj|gfx2' cores/wwfwfest/hdl cores/wwfwfest/mister 2>/dev/null || true
+            echo
+            echo '--- SHA256 of exact HDL used for this build ---'
+            sha256sum cores/wwfwfest/hdl/*.v | sort
+          } > wwfwfest-diag/VIDEO-DIAG.txt
+
+          diff -u \
+            wwfwfest-diag/baseline/jtwwfw_video.v \
+            wwfwfest-diag/post-bgfix1/jtwwfw_video.v \
+            > wwfwfest-diag/BGFix1-video.diff || true
+
+      - name: Compile MiSTer RBF
+        run: |
+          docker run --network host -v "$(pwd)":/jtcores jotego/jtcore20 \
+            /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
+
+      - name: Install exact final MRA
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          data=base64.b64decode("PG1pc3RlcnJvbWRlc2NyaXB0aW9uPgogICAgPGFib3V0IGF1dGhvcj0iTWlzdGVybGFsZWNoZSIvPgogICAgPHJvdGF0aW9uPmhvcml6b250YWw8L3JvdGF0aW9uPgogICAgPG5hbWU+V1dGIFdyZXN0bGVGZXN0IChXb3JsZCk8L25hbWU+CiAgICA8c2V0bmFtZT53d2Z3ZmVzdDwvc2V0bmFtZT4KICAgIDxtYW1ldmVyc2lvbj4wMjgyPC9tYW1ldmVyc2lvbj4KICAgIDx5ZWFyPjE5OTE8L3llYXI+CiAgICA8bWFudWZhY3R1cmVyPlRlY2hub3MgSmFwYW4gKFRlY21vIGxpY2Vuc2UpPC9tYW51ZmFjdHVyZXI+CiAgICA8cGxheWVycz40PC9wbGF5ZXJzPgogICAgPHJiZj5qdHd3ZndmZXN0PC9yYmY+CiAgICA8am95c3RpY2s+ODwvam95c3RpY2s+CiAgICA8cmVnaW9uPldvcmxkPC9yZWdpb24+CiAgICA8cm9tIGluZGV4PSIwIiB6aXA9Ind3ZndmZXN0LnppcCIgbWQ1PSJOb25lIiBhc21fbWQ1PSI5OGUzNzBjZTM0ZDljMWE1ZGNlZmQ2MjAzZGQ4MzE5OCI+CiAgICAgICAgPCEtLSBtYWluY3B1IC0gc3RhcnRzIGF0IDB4MCAtIGxlbmd0aCAweDgwMDAwICgxOSBiaXRzKSAtLT4KICAgICAgICA8aW50ZXJsZWF2ZSBvdXRwdXQ9IjE2Ij4KICAgICAgICAgICAgPHBhcnQgbmFtZT0iMzFlMTMtMC5pYzE5IiBjcmM9ImJkMDJlM2M0IiBtYXA9IjAxIi8+CiAgICAgICAgICAgIDxwYXJ0IG5hbWU9IjMxZTE0LTAuaWMxOCIgY3JjPSI5MzNlYTFhMCIgbWFwPSIxMCIvPgogICAgICAgIDwvaW50ZXJsZWF2ZT4KICAgICAgICA8IS0tIEpURlJBTUVfQkExX1NUQVJUIC0tPgogICAgICAgIDwhLS0gYXVkaW9jcHUgLSBzdGFydHMgYXQgMHg4MDAwMCAtIGxlbmd0aCAweDEwMDAwICgxNiBiaXRzKSAtLT4KICAgICAgICA8cGFydCBuYW1lPSIzMWExMS0yLmljNDIiIGNyYz0iNWRkZWJmZWEiLz4KICAgICAgICA8IS0tIFBDTV9TVEFSVCAtLT4KICAgICAgICA8IS0tIG9raSAtIHN0YXJ0cyBhdCAweDkwMDAwIC0gbGVuZ3RoIDB4ODAwMDAgKDE5IGJpdHMpIC0tPgogICAgICAgIDxwYXJ0IG5hbWU9IjMxajEwLmljNzMiIGNyYz0iNmM1MjJlZGIiLz4KICAgICAgICA8IS0tIEpURlJBTUVfQkEyX1NUQVJUIC0tPgogICAgICAgIDwhLS0gZ2Z4MSAtIHN0YXJ0cyBhdCAweDExMDAwMCAtIGxlbmd0aCAweDIwMDAwICgxNyBiaXRzKSAtLT4KICAgICAgICA8cGFydCBuYW1lPSIzMWUxMi0wLmljMzMiIGNyYz0iMDZmMjI2MTUiLz4KICAgICAgICA8IS0tIFNDUl9TVEFSVCAtLT4KICAgICAgICA8IS0tIGdmeDMgLSBzdGFydHMgYXQgMHgxMzAwMDAgLSBsZW5ndGggMHhEMDAwMCAoMjAgYml0cykgLS0+CiAgICAgICAgPGludGVybGVhdmUgb3V0cHV0PSIxNiI+CiAgICAgICAgICAgIDxwYXJ0IG5hbWU9IjMxajEuaWMyIiBjcmM9IjgyZWQ3MTU1IiBtYXA9IjAxIi8+CiAgICAgICAgICAgIDxwYXJ0IG5hbWU9IjMxajAuaWMxIiBjcmM9IjhhMTJiNDUwIiBtYXA9IjEwIi8+CiAgICAgICAgPC9pbnRlcmxlYXZlPgogICAgICAgIDxwYXJ0IHJlcGVhdD0iMHg1MDAwMCI+IEZGPC9wYXJ0PgogICAgICAgIDwhLS0gSlRGUkFNRV9CQTNfU1RBUlQgLS0+CiAgICAgICAgPCEtLSBnZngyIC0gc3RhcnRzIGF0IDB4MjAwMDAwIC0gbGVuZ3RoIDB4ODAwMDAwICgyMyBiaXRzKSAtLT4KICAgICAgICA8aW50ZXJsZWF2ZSBvdXRwdXQ9IjMyIj4KICAgICAgICAgICAgPHBhcnQgbmFtZT0iMzFqMy5pYzkiIGNyYz0iZTM5NWNmMWQiIG1hcD0iMDAwMSIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo1LmljMTEiIGNyYz0iMmNlNTQ1ZTgiIG1hcD0iMDAxMCIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo2LmljMTIiIGNyYz0iNzk5NTZjZjgiIG1hcD0iMDEwMCIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo5LmljMTUiIGNyYz0iZGQzODcyODkiIG1hcD0iMTAwMCIvPgogICAgICAgIDwvaW50ZXJsZWF2ZT4KICAgICAgICA8aW50ZXJsZWF2ZSBvdXRwdXQ9IjMyIj4KICAgICAgICAgICAgPHBhcnQgbmFtZT0iMzFqMi5pYzgiIGNyYz0iYjVhOTc0NjUiIG1hcD0iMDAwMSIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo0LmljMTAiIGNyYz0iMDBlZGI2NmEiIG1hcD0iMDAxMCIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo3LmljMTMiIGNyYz0iNzRkNzc0YzMiIG1hcD0iMDEwMCIvPgogICAgICAgICAgICA8cGFydCBuYW1lPSIzMWo4LmljMTQiIGNyYz0iNDRhYmUxMjciIG1hcD0iMTAwMCIvPgogICAgICAgIDwvaW50ZXJsZWF2ZT4KICAgICAgICA8IS0tIFRvdGFsIDB4QTAwMDAwIGJ5dGVzIC0gMTAyNDAga0J5dGVzIC0tPgogICAgPC9yb20+CiAgICA8cm9tIGluZGV4PSIxIj4KICAgICAgICA8cGFydD4wMCA4MDwvcGFydD4KICAgIDwvcm9tPgogICAgPHN3aXRjaGVzIHBhZ2VfaWQ9IjEiIHBhZ2VfbmFtZT0iU3dpdGNoZXMiIGJhc2U9IjE2IiBkZWZhdWx0PSJlZixmZiI+CiAgICAgICAgPERTVzEvPgogICAgICAgIDxkaXAgbmFtZT0iQ29pbiBBIiBiaXRzPSIwLDEiIGlkcz0iMy8xLDIvMSwxLzIsMS8xIi8+CiAgICAgICAgPGRpcCBuYW1lPSJCdXkgSW4gUHJpY2UiIGJpdHM9IjIiIGlkcz0iQXMgc3RhcnQgcHJpY2UsMSIvPgogICAgICAgIDxkaXAgbmFtZT0iUmVnYWluIFBvd2VyIFByaWNlIiBiaXRzPSIzIiBpZHM9IkFzIHN0YXJ0IHByaWNlLDEiLz4KICAgICAgICA8ZGlwIG5hbWU9IkNvbnRpbnVlIFByaWNlIiBiaXRzPSI0IiBpZHM9IkFzIHN0YXJ0IHByaWNlLDEiLz4KICAgICAgICA8ZGlwIG5hbWU9IkRlbW8gU291bmRzIiBiaXRzPSI1IiBpZHM9Ik9mZixPbiIvPgogICAgICAgIDxkaXAgbmFtZT0iRmxpcCBTY3JlZW4iIGJpdHM9IjYiIGlkcz0iT24sT2ZmIi8+CiAgICAgICAgPGRpcCBuYW1lPSJGQkkgTG9nbyIgYml0cz0iNyIgaWRzPSJPZmYsT24iLz4KICAgICAgICA8RFNXMi8+CiAgICAgICAgPGRpcCBuYW1lPSJEaWZmaWN1bHR5IiBiaXRzPSI4LDkiIGlkcz0iSGFyZGVzdCxIYXJkLEVhc3ksTm9ybWFsIi8+CiAgICAgICAgPGRpcCBuYW1lPSJQbGF5ZXJzIiBiaXRzPSIxMCwxMSIgaWRzPSItLDIsMyw0Ii8+CiAgICAgICAgPGRpcCBuYW1lPSJDbGVhciBTdGFnZSBQb3dlciBVcCIgYml0cz0iMTMsMTQiIGlkcz0iMCwxMiwzMiwyNCIvPgogICAgICAgIDxkaXAgbmFtZT0iQ2hhbXBpb25zaGlwIEdhbWUiIGJpdHM9IjE1IiBpZHM9IjR0aCw1dGgiLz4KICAgIDwvc3dpdGNoZXM+CiAgICA8YnV0dG9ucyBuYW1lcz0iUHVuY2gsS2ljayxTdGFydCxDb2luIiBkZWZhdWx0PSJBLEIsU3RhcnQsU2VsZWN0IiBjb3VudD0iMiIvPgo8L21pc3RlcnJvbWRlc2NyaXB0aW9uPgo=")
+          m=Path('release/mra/WWF WrestleFest (World).mra')
+          m.write_bytes(data)
+          x=m.read_text()
+          assert '<about author="Misterlaleche"/>' in x
+          assert 'default="ef,ff"' in x
+          assert '<dip name="Flip Screen" bits="6" ids="On,Off"/>' in x
+          for bad in ('jotego','patreon','twitter','Core credits'):
+              assert bad.lower() not in x.lower(), bad
+          print('PASS: exact project MRA installed after JTFRAME generation')
+          PY
+
+      - name: Verify compiled core requested OSD no-logo mode
+        run: |
+          grep -q 'JTFRAME_OSD_NOLOGO' cores/wwfwfest/cfg/macros.def
+          echo 'PASS: JTFRAME_OSD_NOLOGO enabled for this build'
+
+      - name: Collect MiSTer files
+        run: |
+          mkdir -p wwfwfest-release
+          cp release/mister/jtwwfwfest.rbf wwfwfest-release/
+          cp 'release/mra/WWF WrestleFest (World).mra' wwfwfest-release/
+          cp -a wwfwfest-diag wwfwfest-release/diag
+          sha256sum wwfwfest-release/jtwwfwfest.rbf > wwfwfest-release/SHA256.txt
+
+      - name: Upload RBF and MRA
+        uses: actions/upload-artifact@v6
+        with:
+          name: WWF-WrestleFest-MiSTer-VideoProbe
+          path: wwfwfest-release
+          retention-days: 30
