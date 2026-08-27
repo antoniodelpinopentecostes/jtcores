@@ -1,0 +1,130 @@
+name: Build WWF WrestleFest HFIX0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build-wwfwfest-hfix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out JTFRAME
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Check out required public CPU and audio modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
+
+      - name: Restore existing WWF WrestleFest core
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          import re
+
+          workflow = Path(".github/workflows/build-wwfwfest.yml").read_text()
+
+          match = re.search(
+              r"CORE_ARCHIVE:\s*([A-Za-z0-9+/=]+)",
+              workflow
+          )
+          if not match:
+              raise SystemExit("CORE_ARCHIVE not found in build-wwfwfest.yml")
+
+          Path("/tmp/wwfwfest-source.zip").write_bytes(
+              base64.b64decode(match.group(1))
+          )
+          PY
+
+          unzip -q -o /tmp/wwfwfest-source.zip
+
+          test -f cores/wwfwfest/cfg/macros.def
+          test -f cores/wwfwfest/hdl/jtwwfw_obj.v
+          cp "release/mra/WWF WrestleFest (World).mra" \
+             /tmp/wwfwfest-main.mra
+
+      - name: Fix left-edge sprite clipping
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("cores/wwfwfest/hdl/jtwwfw_obj.v")
+          text = path.read_text()
+
+          old = ".HJUMP(0),.LATCH(1),.PACKED(0),"
+          new = ".HJUMP(0),.HFIX(0),.LATCH(1),.PACKED(0),"
+
+          if old not in text:
+              raise SystemExit(
+                  "Expected jtframe_objdraw parameter sequence not found; "
+                  "refusing to patch blindly"
+              )
+
+          path.write_text(text.replace(old, new, 1))
+          print("Applied WrestleFest fix: jtframe_objdraw HFIX=0")
+          PY
+
+          echo "===== Patched object renderer ====="
+          grep -n -A5 -B2 "jtframe_objdraw" \
+            cores/wwfwfest/hdl/jtwwfw_obj.v | tail -n 14
+
+          grep -q '\.HFIX(0)' \
+            cores/wwfwfest/hdl/jtwwfw_obj.v
+
+      - name: Compile MiSTer RBF with JTFRAME
+        run: |
+          docker run --network host -v "$(pwd)":/jtcores \
+            jotego/jtcore20 \
+            /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
+
+      - name: Show Quartus diagnostics after a failure
+        if: failure()
+        run: |
+          echo "===== MAIN QUARTUS LOG ====="
+          if [ -f log/mister/jtwwfwfest.log ]; then
+            tail -n 400 log/mister/jtwwfwfest.log
+          else
+            echo "Main Quartus log not found"
+          fi
+
+          echo "===== SEED REPORTS ====="
+          find cores/wwfwfest/seed -type f \
+            \( -iname '*.log' -o -iname '*.rpt' -o -iname '*.msg' \) \
+            -print 2>/dev/null | while IFS= read -r report; do
+              echo "----- $report -----"
+              tail -n 200 "$report"
+            done
+
+      - name: Collect MiSTer files
+        run: |
+          cp /tmp/wwfwfest-main.mra \
+            "release/mra/WWF WrestleFest (World).mra"
+
+          mkdir -p wwfwfest-release
+
+          find release -type f \
+            \( -iname '*wwfwfest*.rbf' -o -iname '*WrestleFest*.mra' \) \
+            -exec cp -v {} wwfwfest-release/ \;
+
+          test -n "$(
+            find wwfwfest-release -type f \
+              -iname '*.rbf' -print -quit
+          )"
+
+      - name: Upload RBF and MRA
+        uses: actions/upload-artifact@v6
+        with:
+          name: WWF-WrestleFest-MiSTer-HFIX0
+          path: wwfwfest-release
+          if-no-files-found: error
+          retention-days: 30
