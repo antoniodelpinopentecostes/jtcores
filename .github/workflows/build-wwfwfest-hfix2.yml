@@ -1,0 +1,75 @@
+name: Build WWF WrestleFest HFIX0 v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build-wwfwfest-hfix2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out JTFRAME
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Check out required public CPU and audio modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
+
+      - name: Restore existing WWF WrestleFest core
+        run: |
+          CORE_ARCHIVE="$(sed -n 's/^[[:space:]]*CORE_ARCHIVE:[[:space:]]*//p' .github/workflows/build-wwfwfest.yml | head -n 1)"
+          test -n "$CORE_ARCHIVE"
+          printf '%s' "$CORE_ARCHIVE" | base64 --decode > /tmp/wwfwfest-source.zip
+          unzip -q -o /tmp/wwfwfest-source.zip
+          test -f cores/wwfwfest/cfg/macros.def
+          test -f cores/wwfwfest/hdl/jtwwfw_obj.v
+          cp "release/mra/WWF WrestleFest (World).mra" /tmp/wwfwfest-main.mra
+
+      - name: Fix left-edge sprite clipping
+        run: |
+          grep -q '\.HJUMP(0),\.LATCH(1),\.PACKED(0),' cores/wwfwfest/hdl/jtwwfw_obj.v
+          sed -i 's/\.HJUMP(0),\.LATCH(1),\.PACKED(0),/.HJUMP(0),.HFIX(0),.LATCH(1),.PACKED(0),/' cores/wwfwfest/hdl/jtwwfw_obj.v
+          grep -q '\.HFIX(0)' cores/wwfwfest/hdl/jtwwfw_obj.v
+          echo "Applied WrestleFest sprite fix: HFIX=0"
+          grep -n -A4 -B2 'jtframe_objdraw' cores/wwfwfest/hdl/jtwwfw_obj.v | tail -n 12
+
+      - name: Compile MiSTer RBF with JTFRAME
+        run: |
+          docker run --network host -v "$(pwd)":/jtcores \
+            jotego/jtcore20 \
+            /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
+
+      - name: Show Quartus diagnostics after a failure
+        if: failure()
+        run: |
+          echo "===== MAIN QUARTUS LOG ====="
+          if [ -f log/mister/jtwwfwfest.log ]; then
+            tail -n 400 log/mister/jtwwfwfest.log
+          else
+            echo "Main Quartus log not found"
+          fi
+
+      - name: Collect MiSTer files
+        run: |
+          cp /tmp/wwfwfest-main.mra "release/mra/WWF WrestleFest (World).mra"
+          mkdir -p wwfwfest-release
+          find release -type f \( -iname '*wwfwfest*.rbf' -o -iname '*WrestleFest*.mra' \) -exec cp -v {} wwfwfest-release/ \;
+          test -n "$(find wwfwfest-release -type f -iname '*.rbf' -print -quit)"
+
+      - name: Upload RBF and MRA
+        uses: actions/upload-artifact@v6
+        with:
+          name: WWF-WrestleFest-MiSTer-HFIX0-v2
+          path: wwfwfest-release
+          if-no-files-found: error
+          retention-days: 30
