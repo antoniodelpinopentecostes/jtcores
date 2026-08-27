@@ -1,0 +1,279 @@
+name: Build WWF WrestleFest GFXFIX1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build-wwfwfest-gfxfix1.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Check out required modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
+
+      - name: Restore known FreeRunSync baseline
+        run: |
+          BASE=.github/workflows/build-wwfwfest-freerun-sync.yml
+          test -f "$BASE"
+          CORE_ARCHIVE="$(sed -n 's/^          CORE_ARCHIVE: //p' "$BASE" | head -n1)"
+          test -n "$CORE_ARCHIVE"
+          printf '%s' "$CORE_ARCHIVE" | base64 --decode > /tmp/wwfwfest-source.zip
+          unzip -q -o /tmp/wwfwfest-source.zip
+          test -f cores/wwfwfest/hdl/jtwwfw_video.v
+          test -f cores/wwfwfest/hdl/jtwwfw_obj.v
+
+      - name: Apply TEXT fix2 and ColorFix2
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          vpath = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = vpath.read_text()
+
+          text_bits = [
+              6,7,14,15,22,23,30,31,
+              4,5,12,13,20,21,28,29,
+              2,3,10,11,18,19,26,27,
+              0,1,8,9,16,17,24,25
+          ]
+          new_char = "assign char_sorted = {\n    " + \
+              ",".join(f"char_data[{i:2d}]" for i in text_bits) + \
+              "\n};"
+
+          s, n = re.subn(
+              r'assign\s+char_sorted\s*=\s*\{.*?\};',
+              new_char,
+              s,
+              count=1,
+              flags=re.S
+          )
+          if n != 1:
+              raise SystemExit(f'TEXT char_sorted block not found exactly once: {n}')
+
+          for sig in ('fgrom_data','bgrom_data'):
+              pat = re.compile(
+                  r'\.rom_data\(\{\s*' + re.escape(sig) +
+                  r'\[\s*8\s*\].*?' + re.escape(sig) +
+                  r'\[\s*23\s*\]\s*\}\)',
+                  re.S
+              )
+              repl = (
+                  '.rom_data({' +
+                  sig + '[23:16],' +
+                  sig + '[7:0],' +
+                  sig + '[31:24],' +
+                  sig + '[15:8]})'
+              )
+              s, n = pat.subn(repl, s, count=1)
+              if n != 1:
+                  raise SystemExit(f'{sig} legacy unpack block not found exactly once: {n}')
+
+          vpath.write_text(s)
+
+          opath = Path('cores/wwfwfest/hdl/jtwwfw_obj.v')
+          o = opath.read_text()
+
+          sprite_bits = list(range(32))
+          new_sorted = "wire [31:0] sorted = {\n    " + \
+              ",".join(f"obj_data[{i:2d}]" for i in sprite_bits) + \
+              "\n};"
+
+          o, n = re.subn(
+              r'wire\s*\[\s*31\s*:\s*0\s*\]\s*sorted\s*=\s*\{.*?\};',
+              new_sorted,
+              o,
+              count=1,
+              flags=re.S
+          )
+          if n != 1:
+              raise SystemExit(f'Sprite sorted block not found exactly once: {n}')
+
+          opath.write_text(o)
+
+          macros = Path('cores/wwfwfest/cfg/macros.def')
+          m = macros.read_text()
+          if 'JTFRAME_OSD_NOLOGO' not in m:
+              m = m.rstrip() + '\n\nJTFRAME_OSD_NOLOGO\n'
+          macros.write_text(m)
+
+          finalv = vpath.read_text()
+          finalo = opath.read_text()
+
+          assert 'char_data[ 6],char_data[ 7],char_data[14],char_data[15]' in finalv
+          assert 'fgrom_data[23:16],fgrom_data[7:0],fgrom_data[31:24],fgrom_data[15:8]' in finalv
+          assert 'bgrom_data[23:16],bgrom_data[7:0],bgrom_data[31:24],bgrom_data[15:8]' in finalv
+          assert 'obj_data[ 0],obj_data[ 1],obj_data[ 2],obj_data[ 3]' in finalo
+
+          print('PASS: TEXT fix2 installed')
+          print('PASS: ColorFix2 FG/BG installed')
+          print('PASS: ColorFix2 sprites installed')
+          PY
+
+      - name: Apply HFIX0 sprite edge fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_obj.v')
+          s = p.read_text()
+
+          old = '.HJUMP(0),.LATCH(1),.PACKED(0),'
+          new = '.HJUMP(0),.HFIX(0),.LATCH(1),.PACKED(0),'
+
+          if old not in s:
+              raise SystemExit('Expected objdraw HJUMP/LATCH/PACKED parameter sequence not found')
+
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          assert '.HFIX(0)' in p.read_text()
+          print('PASS: HFIX=0 installed; left-edge sprite loss corrected')
+          PY
+
+      - name: Fix tilemap first-8-pixel pipeline and layer/sprite X registration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = p.read_text()
+
+          decl = 'wire [8:0] hcnt, vcnt;'
+          if decl not in s:
+              raise SystemExit('hcnt/vcnt declaration not found')
+
+          hfetch = (
+              "\n// JTFRAME tilemap outputs one 8-pixel fetch group after the address phase.\n"
+              "// Rotate the 448-pixel raster by one group for tile layers only so\n"
+              "// h=440..447 prefetches logical x=0..7 before active video starts.\n"
+              "// Sprites keep native hcnt coordinates; this also restores tile/sprite X registration.\n"
+              "wire [8:0] htile = (hcnt >= 9'd440) ? (hcnt - 9'd440) : (hcnt + 9'd8);\n"
+          )
+          s = s.replace(decl, decl + hfetch, 1)
+
+          old = '.vdump(vpos), .hdump(hcnt), .blankn(LVBL), .flip(flip),'
+          new = '.vdump(vpos), .hdump(htile), .blankn(LVBL), .flip(flip),'
+          n = s.count(old)
+          if n != 3:
+              raise SystemExit(f'Expected exactly 3 tile-layer hdump users, found {n}')
+          s = s.replace(old, new)
+
+          p.write_text(s)
+
+          final = p.read_text()
+          assert final.count('.hdump(htile)') == 3
+          assert final.count('.hdump(hcnt)') == 1   # object renderer only
+          assert "hcnt >= 9'd440" in final
+          print('PASS: text/FG/BG prefetch rotated +8 pixels modulo 448')
+          print('PASS: sprite hdump remains native hcnt')
+          print('PASS: expected fixes: left-edge tile garbage + selector/layer X registration')
+          PY
+
+      - name: Apply CRT centering 40 pixels left
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = p.read_text()
+
+          old_decl = 'wire [8:0] hcnt, vcnt;'
+          new_decl = 'wire [8:0] hcnt, vcnt;\nwire       HS_INT;'
+          if old_decl not in s:
+              raise SystemExit('hcnt/vcnt declaration not found')
+          s = s.replace(old_decl, new_decl, 1)
+
+          old_timing = (
+              '    .rst(rst), .clk(clk), .pxl_cen(pxl_cen), .hcnt(hcnt), .vcnt(vcnt),\n'
+              '    .LHBL(LHBL), .LVBL(LVBL), .HS(HS), .VS(VS), .irq2_tick(irq2_tick)\n'
+              ');'
+          )
+          new_timing = (
+              '    .rst(rst), .clk(clk), .pxl_cen(pxl_cen), .hcnt(hcnt), .vcnt(vcnt),\n'
+              '    .LHBL(LHBL), .LVBL(LVBL), .HS(HS_INT), .VS(VS), .irq2_tick(irq2_tick)\n'
+              ');'
+          )
+          if old_timing not in s:
+              raise SystemExit('Timing instantiation not found')
+          s = s.replace(old_timing, new_timing, 1)
+
+          if s.count('.hs(HS)') != 3:
+              raise SystemExit(f'Expected 3 internal HS users; found {s.count(".hs(HS)")}')
+          s = s.replace('.hs(HS)', '.hs(HS_INT)')
+
+          marker = new_timing + '\n'
+          external = (
+              "// External CRT-centred HSYNC: +40 px relative to original.\n"
+              "// Active raster moves about 40 pixels left; total remains 448.\n"
+              "assign HS = (hcnt >= 9'd376 && hcnt < 9'd408);\n"
+          )
+          if marker not in s:
+              raise SystemExit('Patched timing marker not found')
+          s = s.replace(marker, marker + '\n' + external, 1)
+
+          p.write_text(s)
+
+          final = p.read_text()
+          assert final.count('.hs(HS_INT)') == 3
+          assert "assign HS = (hcnt >= 9'd376 && hcnt < 9'd408);" in final
+          print('PASS: CRT centering installed')
+          print('PASS: external HSYNC = 376..407')
+          print('PASS: porches = front 56 / sync 32 / back 40')
+          print('PASS: expected raster shift = ~40 pixels left')
+          PY
+
+      - name: Compile MiSTer RBF
+        run: |
+          docker run --network host -v "$(pwd)":/jtcores jotego/jtcore20 \
+            /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
+
+      - name: Restore exact known-good project MRA
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          import re
+
+          src = Path('.github/workflows/build-wwfwfest-colorfix2-crtsyncfix1.yml').read_text()
+          m = re.search(r'data=base64\.b64decode\("([A-Za-z0-9+/=]+)"\)', src)
+          if not m:
+              raise SystemExit('Known-good MRA payload not found in ColorFix2+CRTSyncFix1 workflow')
+
+          out = Path('release/mra/WWF WrestleFest (World).mra')
+          out.write_bytes(base64.b64decode(m.group(1)))
+
+          text = out.read_text()
+          assert '<name>WWF WrestleFest (World)</name>' in text
+          assert '<dip name="Flip Screen" bits="6" ids="On,Off"/>' in text
+          print('PASS: exact known-good MRA restored')
+          PY
+
+      - name: Collect MiSTer files
+        run: |
+          mkdir -p wwfwfest-release
+          cp release/mister/jtwwfwfest.rbf wwfwfest-release/
+          cp 'release/mra/WWF WrestleFest (World).mra' wwfwfest-release/
+          sha256sum wwfwfest-release/jtwwfwfest.rbf > wwfwfest-release/SHA256.txt
+
+      - name: Upload RBF and MRA
+        uses: actions/upload-artifact@v6
+        with:
+          name: WWF-WrestleFest-GFXFIX1-TilePrefetch-LeftEdge
+          path: wwfwfest-release
+          if-no-files-found: error
+          retention-days: 30
