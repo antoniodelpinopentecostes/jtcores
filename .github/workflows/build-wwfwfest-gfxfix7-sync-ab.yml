@@ -1,0 +1,595 @@
+name: Build WWF WrestleFest GFXFIX7 SYNC A-B
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/build-wwfwfest-gfxfix7-sync-ab.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Check out required modules
+        run: |
+          git submodule update --init --depth=1 \
+            modules/fx68k modules/jt51 modules/jt6295
+
+      - name: Restore known FreeRunSync baseline
+        run: |
+          BASE=.github/workflows/build-wwfwfest-freerun-sync.yml
+          test -f "$BASE"
+          CORE_ARCHIVE="$(sed -n 's/^          CORE_ARCHIVE: //p' "$BASE" | head -n1)"
+          test -n "$CORE_ARCHIVE"
+          printf '%s' "$CORE_ARCHIVE" | base64 --decode > /tmp/wwfwfest-source.zip
+          unzip -q -o /tmp/wwfwfest-source.zip
+          test -f cores/wwfwfest/hdl/jtwwfw_video.v
+          test -f cores/wwfwfest/hdl/jtwwfw_obj.v
+
+      - name: Apply TEXT fix2 and ColorFix2
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          vpath = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = vpath.read_text()
+
+          text_bits = [
+              6,7,14,15,22,23,30,31,
+              4,5,12,13,20,21,28,29,
+              2,3,10,11,18,19,26,27,
+              0,1,8,9,16,17,24,25
+          ]
+          new_char = "assign char_sorted = {\n    " + \
+              ",".join(f"char_data[{i:2d}]" for i in text_bits) + \
+              "\n};"
+
+          s, n = re.subn(
+              r'assign\s+char_sorted\s*=\s*\{.*?\};',
+              new_char,
+              s,
+              count=1,
+              flags=re.S
+          )
+          if n != 1:
+              raise SystemExit(f'TEXT char_sorted block not found exactly once: {n}')
+
+          for sig in ('fgrom_data','bgrom_data'):
+              pat = re.compile(
+                  r'\.rom_data\(\{\s*' + re.escape(sig) +
+                  r'\[\s*8\s*\].*?' + re.escape(sig) +
+                  r'\[\s*23\s*\]\s*\}\)',
+                  re.S
+              )
+              repl = (
+                  '.rom_data({' +
+                  sig + '[23:16],' +
+                  sig + '[7:0],' +
+                  sig + '[31:24],' +
+                  sig + '[15:8]})'
+              )
+              s, n = pat.subn(repl, s, count=1)
+              if n != 1:
+                  raise SystemExit(f'{sig} legacy unpack block not found exactly once: {n}')
+
+          vpath.write_text(s)
+
+          opath = Path('cores/wwfwfest/hdl/jtwwfw_obj.v')
+          o = opath.read_text()
+
+          sprite_bits = list(range(32))
+          new_sorted = "wire [31:0] sorted = {\n    " + \
+              ",".join(f"obj_data[{i:2d}]" for i in sprite_bits) + \
+              "\n};"
+
+          o, n = re.subn(
+              r'wire\s*\[\s*31\s*:\s*0\s*\]\s*sorted\s*=\s*\{.*?\};',
+              new_sorted,
+              o,
+              count=1,
+              flags=re.S
+          )
+          if n != 1:
+              raise SystemExit(f'Sprite sorted block not found exactly once: {n}')
+
+          opath.write_text(o)
+
+          macros = Path('cores/wwfwfest/cfg/macros.def')
+          m = macros.read_text()
+          if 'JTFRAME_OSD_NOLOGO' not in m:
+              m = m.rstrip() + '\n\nJTFRAME_OSD_NOLOGO\n'
+          macros.write_text(m)
+
+          finalv = vpath.read_text()
+          finalo = opath.read_text()
+
+          assert 'char_data[ 6],char_data[ 7],char_data[14],char_data[15]' in finalv
+          assert 'fgrom_data[23:16],fgrom_data[7:0],fgrom_data[31:24],fgrom_data[15:8]' in finalv
+          assert 'bgrom_data[23:16],bgrom_data[7:0],bgrom_data[31:24],bgrom_data[15:8]' in finalv
+          assert 'obj_data[ 0],obj_data[ 1],obj_data[ 2],obj_data[ 3]' in finalo
+
+          print('PASS: TEXT fix2 installed')
+          print('PASS: ColorFix2 FG/BG installed')
+          print('PASS: ColorFix2 sprites installed')
+          PY
+
+      - name: Apply HFIX0 sprite edge fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_obj.v')
+          s = p.read_text()
+
+          old = '.HJUMP(0),.LATCH(1),.PACKED(0),'
+          new = '.HJUMP(0),.HFIX(0),.LATCH(1),.PACKED(0),'
+
+          if old not in s:
+              raise SystemExit('Expected objdraw HJUMP/LATCH/PACKED parameter sequence not found')
+
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          assert '.HFIX(0)' in p.read_text()
+          print('PASS: HFIX=0 installed; left-edge sprite loss corrected')
+          PY
+
+      - name: Compact enabled sprite descriptors for line renderer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_obj.v')
+          s = p.read_text()
+
+          old = "reg [127:0] descriptors [0:511];\nreg [127:0] build;"
+          new = ("reg [127:0] descriptors [0:511];\n"
+                 "// Number of enabled entries in the compact buffered list.\n"
+                 "reg [9:0] active_count;\n"
+                 "reg [127:0] build;")
+          if old not in s:
+              raise SystemExit('descriptor declaration block not found')
+          s = s.replace(old, new, 1)
+
+          old = ("        build       <= 0;\n"
+                 "    end else begin\n"
+                 "        if(objbuf_trig) begin\n"
+                 "            copying     <= 1;\n"
+                 "            issuing     <= 1;\n"
+                 "            read_valid  <= 0;\n"
+                 "            copy_addr   <= 12'd1;\n"
+                 "            objram_addr <= 0;\n")
+          new = ("        build       <= 0;\n"
+                 "        active_count <= 0;\n"
+                 "    end else begin\n"
+                 "        if(objbuf_trig) begin\n"
+                 "            copying     <= 1;\n"
+                 "            issuing     <= 1;\n"
+                 "            read_valid  <= 0;\n"
+                 "            copy_addr   <= 12'd1;\n"
+                 "            objram_addr <= 0;\n"
+                 "            active_count <= 0;\n")
+          if old not in s:
+              raise SystemExit('snapshot reset/trigger block not found')
+          s = s.replace(old, new, 1)
+
+          old = ("                if(read_addr[2:0] == 3'd7)\n"
+                 "                    descriptors[read_addr[11:3]] <= {objram_dout,build[111:0]};\n")
+          new = ("                if(read_addr[2:0] == 3'd7 && build[16]) begin\n"
+                 "                    // Compact only enabled sprites, preserving original order.\n"
+                 "                    descriptors[active_count[8:0]] <= {objram_dout,build[111:0]};\n"
+                 "                    active_count <= active_count + 1'd1;\n"
+                 "                end\n")
+          if old not in s:
+              raise SystemExit('descriptor completion block not found')
+          s = s.replace(old, new, 1)
+
+          old = ("    end else if(hs && !hs_l) begin\n"
+                 "        scan_idx <= 0;\n"
+                 "        scan_st  <= 1;\n"
+                 "    end else case(scan_st)\n")
+          new = ("    end else if(hs && !hs_l) begin\n"
+                 "        scan_idx <= 0;\n"
+                 "        scan_st  <= active_count == 0 ? 0 : 1;\n"
+                 "    end else case(scan_st)\n")
+          if old not in s:
+              raise SystemExit('scan start block not found')
+          s = s.replace(old, new, 1)
+
+          oldend = "scan_idx == 9'h1ff"
+          if s.count(oldend) != 2:
+              raise SystemExit('unexpected scan-end test count')
+          s = s.replace(oldend, "({1'b0,scan_idx} + 10'd1 >= active_count)")
+
+          p.write_text(s)
+          f = p.read_text()
+          assert 'reg [9:0] active_count;' in f
+          assert 'descriptors[active_count[8:0]]' in f
+          assert f.count("10'd1 >= active_count") == 2
+          print('PASS: buffered sprite list compacted to enabled descriptors')
+          print('PASS: original descriptor order/priority preserved')
+          PY
+
+      - name: Verify original 48 MHz core clocks are preserved
+        run: |
+          ! grep -q '^JTFRAME_SDRAM96$' cores/wwfwfest/cfg/macros.def
+          grep -Fq ".clk(clk), .n(5'd7), .m(5'd24), .cen(pxl_cens), .cenb()" cores/wwfwfest/hdl/jtwwfwfest_game.v
+          grep -Fq ".num(7'd6), .den(8'd24), .DTACKn(DTACKn)," cores/wwfwfest/hdl/jtwwfw_main.v
+          grep -Fq "localparam [14:0] IRQ2_DIV = 15'd29448;" cores/wwfwfest/hdl/jtwwfw_timing.v
+          echo "PASS: core remains at the known 48 MHz JTFRAME clock"
+          echo "PASS: pixel=7 MHz, 68000=12 MHz, IRQ2 unchanged"
+
+      - name: Fix tilemap first-8-pixel pipeline and layer/sprite X registration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = p.read_text()
+
+          decl = 'wire [8:0] hcnt, vcnt;'
+          if decl not in s:
+              raise SystemExit('hcnt/vcnt declaration not found')
+
+          hfetch = (
+              "\n// JTFRAME tilemap outputs one 8-pixel fetch group after the address phase.\n"
+              "// Rotate the 448-pixel raster by one group for tile layers only so\n"
+              "// h=440..447 prefetches logical x=0..7 before active video starts.\n"
+              "// Sprites keep native hcnt coordinates; this also restores tile/sprite X registration.\n"
+              "wire [8:0] htile = (hcnt >= 9'd440) ? (hcnt - 9'd440) : (hcnt + 9'd8);\n"
+          )
+          s = s.replace(decl, decl + hfetch, 1)
+
+          old = '.vdump(vpos), .hdump(hcnt), .blankn(LVBL), .flip(flip),'
+          new = '.vdump(vpos), .hdump(htile), .blankn(LVBL), .flip(flip),'
+          n = s.count(old)
+          if n != 3:
+              raise SystemExit(f'Expected exactly 3 tile-layer hdump users, found {n}')
+          s = s.replace(old, new)
+
+          p.write_text(s)
+
+          final = p.read_text()
+          assert final.count('.hdump(htile)') == 3
+          assert final.count('.hdump(hcnt)') == 1   # object renderer only
+          assert "hcnt >= 9'd440" in final
+          print('PASS: text/FG/BG prefetch rotated +8 pixels modulo 448')
+          print('PASS: sprite hdump remains native hcnt')
+          print('PASS: expected fixes: left-edge tile garbage + selector/layer X registration')
+          PY
+
+      - name: Verify native 0..239 vertical layer coordinates
+        run: |
+          grep -q "wire \[8:0\] vpos = vcnt - 9'd8;" cores/wwfwfest/hdl/jtwwfw_video.v
+          echo "PASS: active line 8 maps to graphics Y=0; active line 247 maps to Y=239"
+
+      - name: Apply Technos one-extra-pixel left-edge phase fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('cores/wwfwfest/hdl/jtwwfw_timing.v')
+          s=p.read_text()
+          old='assign LHBL = hcnt < H_ACTIVE;'
+          new=("// TA-0031 renderer needs one extra horizontal source pixel; expose\n"
+               "// a 320-pixel window at h=1..320 instead of the junk wrap pixel h=0.\n"
+               "assign LHBL = hcnt >= 9'd1 && hcnt < 9'd321;")
+          if old not in s:
+              raise SystemExit('native LHBL assignment not found')
+          p.write_text(s.replace(old,new,1))
+          assert "hcnt >= 9'd1 && hcnt < 9'd321" in p.read_text()
+          print('PASS: 320 visible pixels now use h=1..320; junk left wrap pixel hidden')
+          PY
+
+      - name: Apply CRT centering 40 pixels left
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('cores/wwfwfest/hdl/jtwwfw_video.v')
+          s = p.read_text()
+
+          old_decl = 'wire [8:0] hcnt, vcnt;'
+          new_decl = 'wire [8:0] hcnt, vcnt;\nwire       HS_INT;'
+          if old_decl not in s:
+              raise SystemExit('hcnt/vcnt declaration not found')
+          s = s.replace(old_decl, new_decl, 1)
+
+          old_timing = (
+              '    .rst(rst), .clk(clk), .pxl_cen(pxl_cen), .hcnt(hcnt), .vcnt(vcnt),\n'
+              '    .LHBL(LHBL), .LVBL(LVBL), .HS(HS), .VS(VS), .irq2_tick(irq2_tick)\n'
+              ');'
+          )
+          new_timing = (
+              '    .rst(rst), .clk(clk), .pxl_cen(pxl_cen), .hcnt(hcnt), .vcnt(vcnt),\n'
+              '    .LHBL(LHBL), .LVBL(LVBL), .HS(HS_INT), .VS(VS), .irq2_tick(irq2_tick)\n'
+              ');'
+          )
+          if old_timing not in s:
+              raise SystemExit('Timing instantiation not found')
+          s = s.replace(old_timing, new_timing, 1)
+
+          if s.count('.hs(HS)') != 3:
+              raise SystemExit(f'Expected 3 internal HS users; found {s.count(".hs(HS)")}')
+          s = s.replace('.hs(HS)', '.hs(HS_INT)')
+
+          marker = new_timing + '\n'
+          external = (
+              "// External CRT-centred HSYNC: +40 px relative to original.\n"
+              "// Active raster moves about 40 pixels left; total remains 448.\n"
+              "assign HS = (hcnt >= 9'd376 && hcnt < 9'd408);\n"
+          )
+          if marker not in s:
+              raise SystemExit('Patched timing marker not found')
+          s = s.replace(marker, marker + '\n' + external, 1)
+
+          p.write_text(s)
+
+          final = p.read_text()
+          assert final.count('.hs(HS_INT)') == 3
+          assert "assign HS = (hcnt >= 9'd376 && hcnt < 9'd408);" in final
+          print('PASS: CRT centering installed')
+          print('PASS: external HSYNC = 376..407')
+          print('PASS: porches = front 56 / sync 32 / back 40')
+          print('PASS: expected raster shift = ~40 pixels left')
+          PY
+
+      - name: Expand analogue CRT horizontal offset range
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('modules/jtframe/hdl/video/jtframe_resync.v')
+          s = p.read_text()
+          old = (
+              "wire [CNTW-1:0]  hpos_off = WIDE==1 ? { {CNTW-5{hoffset[3]}}, hoffset[3:0], 1'b0 }:\n"
+              "                                      { {CNTW-4{hoffset[3]}}, hoffset[3:0]  };"
+          )
+          new = (
+              "wire [CNTW-1:0]  hpos_off = WIDE==1 ? { {CNTW-6{hoffset[3]}}, hoffset[3:0], 2'b00 }:\n"
+              "                                      { {CNTW-4{hoffset[3]}}, hoffset[3:0]  };"
+          )
+          if old not in s:
+              raise SystemExit('JTFRAME WIDE horizontal offset expression not found')
+          p.write_text(s.replace(old, new, 1))
+
+          c = Path('modules/jtframe/target/mister/cfgstr')
+          q = c.read_text()
+          oldmenu = 'P1oLO,CRT H offset,0,+1,+2,+3,+4,+5,+6,+7,-8,-7,-6,-5,-4,-3,-2,-1;'
+          newmenu = 'P1oLO,CRT H offset,0,+4,+8,+12,+16,+20,+24,+28,-32,-28,-24,-20,-16,-12,-8,-4;'
+          if oldmenu not in q:
+              raise SystemExit('JTFRAME CRT H offset menu line not found')
+          c.write_text(q.replace(oldmenu, newmenu, 1))
+
+          assert "hoffset[3:0], 2'b00" in p.read_text()
+          assert 'CRT H offset,0,+4,+8,+12,+16,+20,+24,+28,-32' in c.read_text()
+          print('PASS: CRT H offset = approximately -32..+28 source pixels')
+          print('PASS: CRT V offset remains -8..+7 lines')
+          PY
+
+      - name: Rebalance OKI combat FX and make OSD levels measurable
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Give the OKI channel +6 dB of static mixer gain versus GFXFIX4.
+          # This changes the JTFRAME analogue-model mixer itself, rather than
+          # trying to boost a full-scale 14-bit PCM signal only before mixing.
+          mem = Path('cores/wwfwfest/cfg/mem.yaml')
+          s = mem.read_text()
+          old = '- { name: pcm, module: jt6295, rsum: 10k, fir: fir_192k_4k.csv }'
+          new = '- { name: pcm, module: jt6295, rsum: 5k, fir: fir_192k_4k.csv }'
+          if old not in s:
+              raise SystemExit('PCM 10k mixer entry not found')
+          mem.write_text(s.replace(old, new, 1))
+
+          macros = Path('cores/wwfwfest/cfg/macros.def')
+          m = macros.read_text()
+          if 'JTFRAME_OSD_VOL' not in m:
+              m = m.rstrip() + '\nJTFRAME_OSD_VOL\n'
+          macros.write_text(m)
+
+          # The mixer now supplies the +6 dB boost. Use dip_fxlevel to attenuate
+          # the raw OKI signal for lower settings, so every OSD position produces
+          # a real and easy-to-hear level change:
+          #   very low = 0.5x raw -> approximately original GFXFIX4 level
+          #   low      = 0.75x raw
+          #   high     = 1.0x raw -> +6 dB default
+          #   very high= 1.25x raw -> about +8 dB, with saturation protection
+          game = Path('cores/wwfwfest/hdl/jtwwfwfest_game.v')
+          g = game.read_text()
+          anchor = 'wire [ 1:0] pxl_cens;\n'
+          insert = (
+              "wire signed [13:0] pcm_raw;\n"
+              "wire signed [14:0] pcm_ext = {{1{pcm_raw[13]}},pcm_raw};\n"
+              "reg  signed [14:0] pcm_level;\n"
+              "reg  signed [13:0] pcm_osd;\n"
+              "\n"
+              "// OSD FX level: 0=very low, 1=low, 2=high(default), 3=very high.\n"
+              "always @* begin\n"
+              "    case(dip_fxlevel)\n"
+              "        2'd0: pcm_level = pcm_ext >>> 1;\n"
+              "        2'd1: pcm_level = pcm_ext - (pcm_ext >>> 2);\n"
+              "        2'd2: pcm_level = pcm_ext;\n"
+              "        default: pcm_level = pcm_ext + (pcm_ext >>> 2);\n"
+              "    endcase\n"
+              "    if(pcm_level > 15'sd8191)\n"
+              "        pcm_osd = 14'sd8191;\n"
+              "    else if(pcm_level < -15'sd8192)\n"
+              "        pcm_osd = -14'sd8192;\n"
+              "    else\n"
+              "        pcm_osd = pcm_level[13:0];\n"
+              "end\n"
+              "assign pcm = pcm_osd;\n"
+              "\n"
+          )
+          if anchor not in g:
+              raise SystemExit('game signal declaration anchor not found')
+          g = g.replace(anchor, anchor + insert, 1)
+
+          oldport = '.fm_l(fm_l), .fm_r(fm_r), .pcm(pcm)'
+          newport = '.fm_l(fm_l), .fm_r(fm_r), .pcm(pcm_raw)'
+          if oldport not in g:
+              raise SystemExit('sound PCM output connection not found')
+          game.write_text(g.replace(oldport, newport, 1))
+
+          final = game.read_text()
+          assert '.pcm(pcm_raw)' in final
+          assert 'assign pcm = pcm_osd;' in final
+          assert 'case(dip_fxlevel)' in final
+          assert 'rsum: 5k' in mem.read_text()
+          assert 'JTFRAME_OSD_VOL' in macros.read_text()
+
+          print('PASS: OKI mixer gain changed 10k -> 5k (~+6 dB)')
+          print('PASS: FX OSD now uses attenuation around the boosted mixer level')
+          print('PASS: very low should be close to old GFXFIX4; high is boosted default')
+          print('PASS: YM2151 music path is untouched')
+          PY
+
+      - name: Verify GFXFIX4 sprite scanner was preserved
+        run: |
+          grep -q 'scan_st  <= 1;' cores/wwfwfest/hdl/jtwwfw_obj.v
+          ! grep -q 'Pipeline next BRAM read' cores/wwfwfest/hdl/jtwwfw_obj.v
+          ! grep -q "scan_desc <= descriptors\[scan_idx + 1'd1\]" cores/wwfwfest/hdl/jtwwfw_obj.v
+          echo 'PASS: no GFXFIX5 descriptor prefetch/pipeline remains'
+          echo 'PASS: sprite engine is exactly the GFXFIX4 compact-list scanner'
+
+      - name: Add JTFRAME versus RAW core sync diagnostic selector
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Add one core-specific OSD bit. OF maps to status[15].
+          # 0 = normal JTFRAME resync path
+          # 1 = bypass jtframe_resync and feed the game's HS/VS directly
+          #     into the remaining MiSTer video path.
+          macros = Path('cores/wwfwfest/cfg/macros.def')
+          m = macros.read_text()
+          if 'CORE_OSD=' in m:
+              raise SystemExit('Unexpected existing CORE_OSD in WrestleFest macros; refusing to overwrite it')
+          m = m.rstrip() + '\nCORE_OSD=OF,CRT Sync,JTFRAME,RAW Core;\n'
+          macros.write_text(m)
+
+          p = Path('modules/jtframe/target/mister/hdl/jtframe_mister.sv')
+          s = p.read_text()
+
+          anchor = 'wire        hs_resync, vs_resync;\n'
+          insert = (
+              "wire        hs_resync, vs_resync;\n"
+              "// WrestleFest diagnostic A/B: status[15]=1 bypasses jtframe_resync.\n"
+              "wire        hs_syncsel = status[15] ? hs : hs_resync;\n"
+              "wire        vs_syncsel = status[15] ? vs : vs_resync;\n"
+          )
+          if anchor not in s:
+              raise SystemExit('hs_resync/vs_resync declaration not found')
+          s = s.replace(anchor, insert, 1)
+
+          old = (
+              "        .HS_in      ( hs_resync ),\n"
+              "        .VS_in      ( vs_resync ),"
+          )
+          new = (
+              "        .HS_in      ( hs_syncsel ),\n"
+              "        .VS_in      ( vs_syncsel ),"
+          )
+          if old not in s:
+              raise SystemExit('jtframe_hsize HS/VS input pair not found')
+          s = s.replace(old, new, 1)
+
+          # Also patch the DEBUG_NOHDMI fallback so both compilation paths
+          # represent the same A/B choice.
+          oldfb = (
+              "    assign hsize_hs = hs_resync;\n"
+              "    assign hsize_vs = vs_resync;"
+          )
+          newfb = (
+              "    assign hsize_hs = hs_syncsel;\n"
+              "    assign hsize_vs = vs_syncsel;"
+          )
+          if oldfb in s:
+              s = s.replace(oldfb, newfb, 1)
+
+          p.write_text(s)
+
+          f = p.read_text()
+          assert 'hs_syncsel = status[15] ? hs : hs_resync;' in f
+          assert 'vs_syncsel = status[15] ? vs : vs_resync;' in f
+          assert '.HS_in      ( hs_syncsel )' in f
+          assert '.VS_in      ( vs_syncsel )' in f
+          assert 'CORE_OSD=OF,CRT Sync,JTFRAME,RAW Core;' in macros.read_text()
+
+          print('PASS: OSD selector added: CRT Sync = JTFRAME / RAW Core')
+          print('PASS: RAW Core bypasses jtframe_resync HS/VS only')
+          print('PASS: RGB, blanking, pixel clock, 320x240 active area and gameplay timing are unchanged')
+          print('NOTE: H/V offset controls act only in JTFRAME mode; RAW mode intentionally bypasses them')
+          PY
+
+      - name: Compile MiSTer RBF
+        run: |
+          docker run --network host -v "$(pwd)":/jtcores jotego/jtcore20 \
+            /jtcores/modules/jtframe/devops/xjtcore.sh wwfwfest mister
+
+      - name: Show Quartus diagnostics after a failure
+        if: failure()
+        run: |
+          echo "===== GFXFIX7-SYNC-AB JTCORE / QUARTUS LOGS ====="
+          for f in log/mister/jtwwfwfest.log cores/wwfwfest/seed/mister/0/jtcore.log; do
+            if [ -f "$f" ]; then
+              echo "----- $f -----"
+              tail -n 500 "$f"
+            fi
+          done
+
+          echo "===== REPORTS ====="
+          find cores/wwfwfest/seed/mister/0 -type f \
+            \( -iname '*.log' -o -iname '*.rpt' -o -iname '*.msg' \) \
+            -print 2>/dev/null | while IFS= read -r report; do
+              echo "----- $report -----"
+              tail -n 250 "$report"
+            done
+
+      - name: Restore exact known-good project MRA
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          import re
+
+          src = Path('.github/workflows/build-wwfwfest-colorfix2-crtsyncfix1.yml').read_text()
+          m = re.search(r'data=base64\.b64decode\("([A-Za-z0-9+/=]+)"\)', src)
+          if not m:
+              raise SystemExit('Known-good MRA payload not found in ColorFix2+CRTSyncFix1 workflow')
+
+          out = Path('release/mra/WWF WrestleFest (World).mra')
+          out.write_bytes(base64.b64decode(m.group(1)))
+
+          text = out.read_text()
+          assert '<name>WWF WrestleFest (World)</name>' in text
+          assert '<dip name="Flip Screen" bits="6" ids="On,Off"/>' in text
+          print('PASS: exact known-good MRA restored')
+          PY
+
+      - name: Collect MiSTer files
+        run: |
+          mkdir -p wwfwfest-release
+          cp release/mister/jtwwfwfest.rbf wwfwfest-release/
+          cp 'release/mra/WWF WrestleFest (World).mra' wwfwfest-release/
+          sha256sum wwfwfest-release/jtwwfwfest.rbf > wwfwfest-release/SHA256.txt
+
+      - name: Upload RBF and MRA
+        uses: actions/upload-artifact@v6
+        with:
+          name: WWF-WrestleFest-GFXFIX7-SYNC-AB
+          path: wwfwfest-release
+          if-no-files-found: error
+          retention-days: 30
